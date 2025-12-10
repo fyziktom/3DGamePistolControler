@@ -61,6 +61,11 @@ float centerPitch = 0.0f;
 float centerRoll = 0.0f;
 float centerYaw = 0.0f;
 
+// Gyro biases to reduce drift.
+float gyroBiasX = 0.0f;
+float gyroBiasY = 0.0f;
+float gyroBiasZ = 0.0f;
+
 unsigned long lastUpdateMs = 0;
 
 bool isActivated = true;
@@ -92,6 +97,27 @@ float computeAccelRoll(float ax, float ay, float az) {
   return atan2f(ay, az) * 180.0f / PI;
 }
 
+void calibrateGyroBias() {
+  const int samples = 200;
+  float sumX = 0.0f;
+  float sumY = 0.0f;
+  float sumZ = 0.0f;
+
+  for (int i = 0; i < samples; ++i) {
+    float gx, gy, gz;
+    if (M5.Imu.getGyro(&gx, &gy, &gz)) {
+      sumX += gx;
+      sumY += gy;
+      sumZ += gz;
+    }
+    delay(2);
+  }
+
+  gyroBiasX = sumX / samples;
+  gyroBiasY = sumY / samples;
+  gyroBiasZ = sumZ / samples;
+}
+
 void initImuFilter() {
   float ax, ay, az;
   if (M5.Imu.getAccel(&ax, &ay, &az)) {
@@ -115,6 +141,10 @@ void updateOrientation() {
   if (!M5.Imu.getGyro(&gx, &gy, &gz)) {
     return;
   }
+
+  gx -= gyroBiasX;
+  gy -= gyroBiasY;
+  gz -= gyroBiasZ;
 
   unsigned long now = millis();
   float dt = (now - lastUpdateMs) / 1000.0f;
@@ -167,6 +197,8 @@ void updateDebugDisplay(float deltaPitch, float deltaRoll, int dx, int dy) {
 }
 
 void calibrateCenter() {
+  calibrateGyroBias(); // Refresh bias; assume stationary during calibration.
+
   const int samples = 200;
   float sumPitch = 0.0f;
   float sumRoll = 0.0f;
@@ -291,6 +323,7 @@ void setup() {
   left_button_last_state = digitalRead(LEFT_BUTTON);
   right_button_last_state = digitalRead(RIGHT_BUTTON);
 
+  calibrateGyroBias();
   initImuFilter();
   calibrateCenter();
 }
