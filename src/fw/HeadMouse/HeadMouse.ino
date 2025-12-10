@@ -12,19 +12,54 @@
 const int LEFT_BUTTON = 33;
 const int RIGHT_BUTTON = 32;
 
+// Axis mapping helpers.
+// Leave defaults for current behavior. If you mount the IMU differently:
+// - Set HEADMOUSE_SWAP_TILT_AXES to 1 to swap which tilt drives X/Y.
+// - Set HEADMOUSE_INVERT_X or HEADMOUSE_INVERT_Y to 1 to flip direction.
+#define AXIS_PITCH 0
+#define AXIS_ROLL  1
+#define AXIS_YAW   2
+
+#ifndef HEADMOUSE_SWAP_TILT_AXES
+#define HEADMOUSE_SWAP_TILT_AXES 0
+#endif
+#ifndef HEADMOUSE_INVERT_X
+#define HEADMOUSE_INVERT_X 1
+#endif
+#ifndef HEADMOUSE_INVERT_Y
+#define HEADMOUSE_INVERT_Y 0
+#endif
+// Direct axis selection (overrides the swap flag if set).
+#ifndef HEADMOUSE_AXIS_X
+#define HEADMOUSE_AXIS_X AXIS_YAW   // Default: roll (left/right tilt) moves mouse X.
+#define HEADMOUSE_AXIS_X_IS_DEFAULT 1
+#else
+#define HEADMOUSE_AXIS_X_IS_DEFAULT 0
+#endif
+#ifndef HEADMOUSE_AXIS_Y
+#define HEADMOUSE_AXIS_Y AXIS_PITCH  // Default: pitch (nodding) moves mouse Y.
+#define HEADMOUSE_AXIS_Y_IS_DEFAULT 1
+#else
+#define HEADMOUSE_AXIS_Y_IS_DEFAULT 0
+#endif
+
 // Tunable parameters.
 float complementaryAlpha = 0.98f;     // Blend factor between gyro integration and accelerometer tilt (0.95-0.99). Higher trusts gyro more.
 float deadzonePitchDeg = 2.0f;        // Pitch deadzone in degrees (1-5 deg). Increase if jittery.
 float deadzoneRollDeg = 2.0f;         // Roll deadzone in degrees (1-5 deg). Increase if jittery.
+float deadzoneYawDeg = 3.0f;          // Yaw deadzone in degrees (gyro-derived, can drift). Increase if noisy.
 float sensitivityPitch = 0.6f;        // Non-linear scale for mouse speed on Y. Raise for faster response (0.3-1.0 recommended).
 float sensitivityRoll = 0.6f;         // Non-linear scale for mouse speed on X. Raise for faster response (0.3-1.0 recommended).
+float sensitivityYaw = 0.4f;          // Lower default sensitivity for yaw to reduce drift impact.
 float maxStepPerUpdate = 15.0f;       // Max pixels per loop for each axis. Reduce if motion feels too fast.
 
 // Filtered orientation.
 float pitch = 0.0f;       // Head tilt forward/back in degrees.
 float roll = 0.0f;        // Head tilt left/right in degrees.
+float yaw = 0.0f;         // Head turn left/right in degrees (gyro integrated, can drift).
 float centerPitch = 0.0f;
 float centerRoll = 0.0f;
+float centerYaw = 0.0f;
 
 unsigned long lastUpdateMs = 0;
 
@@ -66,6 +101,7 @@ void initImuFilter() {
     pitch = 0.0f;
     roll = 0.0f;
   }
+  yaw = 0.0f;
   lastUpdateMs = millis();
 }
 
@@ -92,9 +128,11 @@ void updateOrientation() {
 
   float pitchGyro = pitch + gy * dt;
   float rollGyro = roll + gx * dt;
+  float yawGyro = yaw + gz * dt; // No accelerometer reference; expect slow drift.
 
   pitch = complementaryAlpha * pitchGyro + (1.0f - complementaryAlpha) * pitchAcc;
   roll = complementaryAlpha * rollGyro + (1.0f - complementaryAlpha) * rollAcc;
+  yaw = yawGyro;
 }
 
 // Applies a quadratic response after removing a deadzone so small angles move slowly and larger angles accelerate.
@@ -122,6 +160,7 @@ void updateDebugDisplay(float deltaPitch, float deltaRoll, int dx, int dy) {
   M5.Display.setTextColor(WHITE);
   M5.Display.printf("Pitch: %.2f\n", pitch);
   M5.Display.printf("Roll : %.2f\n", roll);
+  M5.Display.printf("Yaw  : %.2f\n", yaw);
   M5.Display.printf("dP   : %.2f\n", deltaPitch);
   M5.Display.printf("dR   : %.2f\n", deltaRoll);
   M5.Display.printf("dx/dy: %d / %d\n", dx, dy);
@@ -131,16 +170,19 @@ void calibrateCenter() {
   const int samples = 200;
   float sumPitch = 0.0f;
   float sumRoll = 0.0f;
+  float sumYaw = 0.0f;
 
   for (int i = 0; i < samples; ++i) {
     updateOrientation();
     sumPitch += pitch;
     sumRoll += roll;
+    sumYaw += yaw;
     delay(5);
   }
 
   centerPitch = sumPitch / samples;
   centerRoll = sumRoll / samples;
+  centerYaw = sumYaw / samples;
 }
 
 void handleHomeButton() {
@@ -168,14 +210,40 @@ void handleHomeButton() {
 void updateMouseFromHead() {
   updateOrientation();
 
-  const float pitchSign = 1.0f; // Set to -1.0f to invert forward/back cursor direction.
-  const float rollSign = 1.0f;  // Set to -1.0f to invert left/right cursor direction.
-
   float deltaPitch = pitch - centerPitch; // Positive when tilting forward.
   float deltaRoll = roll - centerRoll;    // Positive when tilting right.
+  float deltaYaw = yaw - centerYaw;       // Positive when turning right.
 
-  float moveY = pitchSign * applyCurve(deltaPitch, deadzonePitchDeg, sensitivityPitch, maxStepPerUpdate);
-  float moveX = rollSign * applyCurve(deltaRoll, deadzoneRollDeg, sensitivityRoll, maxStepPerUpdate);
+  float pitchStep = applyCurve(deltaPitch, deadzonePitchDeg, sensitivityPitch, maxStepPerUpdate);
+  float rollStep = applyCurve(deltaRoll, deadzoneRollDeg, sensitivityRoll, maxStepPerUpdate);
+  float yawStep = applyCurve(deltaYaw, deadzoneYawDeg, sensitivityYaw, maxStepPerUpdate);
+
+  // Apply legacy swap flag unless explicit axis selection is provided.
+  int axisX = HEADMOUSE_AXIS_X;
+  int axisY = HEADMOUSE_AXIS_Y;
+  if (HEADMOUSE_SWAP_TILT_AXES && HEADMOUSE_AXIS_X_IS_DEFAULT && HEADMOUSE_AXIS_Y_IS_DEFAULT) {
+    axisX = AXIS_PITCH;
+    axisY = AXIS_ROLL;
+  }
+
+  auto selectStep = [&](int axis) -> float {
+    switch (axis) {
+      case AXIS_PITCH: return pitchStep;
+      case AXIS_ROLL:  return rollStep;
+      case AXIS_YAW:   return yawStep;
+      default:         return 0.0f;
+    }
+  };
+
+  float moveX = selectStep(axisX);
+  float moveY = selectStep(axisY);
+
+#if HEADMOUSE_INVERT_X
+  moveX = -moveX;
+#endif
+#if HEADMOUSE_INVERT_Y
+  moveY = -moveY;
+#endif
 
   int dx = (int)lrintf(moveX);
   int dy = (int)lrintf(moveY);
