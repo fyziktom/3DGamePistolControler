@@ -15,8 +15,10 @@ struct AudioStats {
 #define M5_LED 10
 #endif
 
-#define ENABLE_DEBUG_DISPLAY true
+#define ENABLE_DEBUG_DISPLAY false
 #define ENABLE_AUDIO_DEBUG false
+#define ENABLE_AUDIO_SERIAL_DEBUG false
+#define ALLOW_AUDIO_COMMANDS false
 
 // External buttons used as mouse buttons.
 const int LEFT_BUTTON = 33;
@@ -78,7 +80,7 @@ float gyroBiasZ = 0.0f;
 
 unsigned long lastUpdateMs = 0;
 
-bool isActivated = true;
+bool isActivated = false; // Starts not activated and you must press Home button to activate the reading of movements
 bool homeHoldTriggered = false;
 unsigned long homePressStart = 0;
 bool audioInputReady = false;
@@ -100,8 +102,9 @@ const size_t AUDIO_BLOCK_SAMPLES = 256; // 16 ms at 16 kHz
 float audioThreshold = 500.0f;              // Level above noiseFloor that starts an impulse.
 unsigned long shortEventMaxMs = 200;        // Max duration for a short impulse.
 unsigned long longEventMinMs = 500;         // Min duration for a long blow.
-unsigned long doubleClickWindowMs = 450;    // Time window between two short impulses for right click.
 float noiseFloorAdaptRate = 0.003f;         // Lower values adapt slower but resist noise changes.
+float toneMinRms = 1200.0f;                 // Minimum RMS before attempting tone detection.
+float toneDominanceRatio = 20.0f;           // Tone peak must exceed this multiple of average power.
 
 // Impulse detector.
 enum AudioImpulseState {
@@ -111,73 +114,22 @@ enum AudioImpulseState {
 AudioImpulseState impulseState = AUDIO_IMPULSE_IDLE;
 unsigned long impulseStartMs = 0;
 float impulsePeakLevel = 0.0f;
-unsigned long lastShortImpulseTime = 0;
+unsigned long lastImpulseEventMs = 0;
+unsigned long impulseRefractoryMs = 250;
 
 bool scrollModeActive = false;
 unsigned long scrollModeUntilMs = 0;
 unsigned long scrollModeDurationMs = 1500; // Time after a long blow where pitch drives scroll.
 
-// Tone bands and detection (mini-DTMF style).
-enum AudioToneId {
-  TONE_NONE = -1,
-  TONE_C = 0,
-  TONE_E = 1,
-  TONE_G = 2
+// Frequency event history for relative tone sequences.
+struct FreqEvent {
+  float freq;
+  unsigned long time;
 };
 
-struct ToneBand {
-  AudioToneId id;
-  float centerHz;
-  float bandwidthHz;
-};
-
-const ToneBand kToneBands[] = {
-  { TONE_C, 523.25f, 40.0f },  // C5-ish
-  { TONE_E, 659.25f, 40.0f },  // E5-ish
-  { TONE_G, 783.99f, 40.0f }   // G5-ish
-};
-
-enum ToneSegmentState {
-  TONE_SEGMENT_NONE,
-  TONE_SEGMENT_ACTIVE
-};
-
-struct ToneSegment {
-  AudioToneId toneId;
-  unsigned long startMs;
-  unsigned long endMs;
-};
-
-struct DetectedToneEvent {
-  AudioToneId toneId;
-  unsigned long timeMs;
-};
-
-DetectedToneEvent toneHistory[8];
-int toneHistoryCount = 0;
-int toneHistoryIndex = 0;
-
-ToneSegmentState toneSegState = TONE_SEGMENT_NONE;
-ToneSegment currentToneSegment = { TONE_NONE, 0, 0 };
-
-// Tone command handling.
-typedef void (*AudioCommandCallback)();
-
-struct AudioToneCommand {
-  const char* name;
-  const AudioToneId* sequence;
-  int length;
-  unsigned long maxTotalDurationMs;
-  AudioCommandCallback callback;
-};
-
-void onRecenterCommand();
-const AudioToneId kRecenterSeq[] = { TONE_C, TONE_E, TONE_G };
-
-AudioToneCommand g_audioCommands[] = {
-  { "recenter", kRecenterSeq, 3, 2000, onRecenterCommand },
-};
-const int g_numAudioCommands = sizeof(g_audioCommands) / sizeof(g_audioCommands[0]);
+FreqEvent freqHistory[8];
+int freqHistoryCount = 0;
+int freqHistoryIndex = 0;
 
 // Audio levels.
 float noiseFloor = 0.0f;
@@ -446,8 +398,7 @@ void updateNoiseFloor(float rms) {
 // ---------------------------------------------------------------------------
 // Goertzel-based tone detection
 // ---------------------------------------------------------------------------
-float goertzelPower(const int16_t* buffer, size_t count, float targetFreq, float bandwidth) {
-  // Bandwidth is used only to slightly widen the window by blending nearby bins.
+float goertzelPower(const int16_t* buffer, size_t count, float targetFreq) {
   float k = 0.5f + ((count * targetFreq) / (float)AUDIO_SAMPLE_RATE);
   int kInt = (int)k;
   float omega = (2.0f * PI * kInt) / (float)count;
@@ -463,127 +414,148 @@ float goertzelPower(const int16_t* buffer, size_t count, float targetFreq, float
   return power;
 }
 
-AudioToneId detectTone(const int16_t* buffer, size_t numSamples) {
+float detectDominantFrequency(const int16_t* buffer, size_t numSamples) {
   if (numSamples == 0) {
-    return TONE_NONE;
+    return 0.0f;
   }
-  float bestPower = 0.0f;
-  AudioToneId bestId = TONE_NONE;
-  float totalPower = 0.0f;
-  for (size_t i = 0; i < numSamples; ++i) {
-    float s = (float)buffer[i];
-    totalPower += s * s;
-  }
+  const float startHz = 200.0f;
+  const float endHz = 2000.0f;
+  const float stepHz = 40.0f;
 
-  for (size_t i = 0; i < sizeof(kToneBands) / sizeof(kToneBands[0]); ++i) {
-    float p = goertzelPower(buffer, numSamples, kToneBands[i].centerHz, kToneBands[i].bandwidthHz);
+  float bestPower = 0.0f;
+  float bestFreq = 0.0f;
+  float sumPower = 0.0f;
+  int binCount = 0;
+
+  for (float f = startHz; f <= endHz; f += stepHz) {
+    float p = goertzelPower(buffer, numSamples, f);
+    sumPower += p;
+    binCount++;
     if (p > bestPower) {
       bestPower = p;
-      bestId = kToneBands[i].id;
+      bestFreq = f;
     }
   }
 
-  if (bestPower < 5.0f * totalPower / (float)numSamples) { // Needs to stand out above broadband energy.
-    return TONE_NONE;
+  if (binCount == 0) {
+    return 0.0f;
   }
-
-  return bestId;
+  float avgPower = sumPower / (float)binCount;
+  if (bestPower < toneDominanceRatio * avgPower) {
+    return 0.0f; // Not tone-like enough.
+  }
+  return bestFreq;
 }
 
 // ---------------------------------------------------------------------------
 // Tone segment handling and history
 // ---------------------------------------------------------------------------
-void pushToneEvent(AudioToneId id, unsigned long timeMs) {
-  toneHistory[toneHistoryIndex] = { id, timeMs };
-  toneHistoryIndex = (toneHistoryIndex + 1) % (int)(sizeof(toneHistory) / sizeof(toneHistory[0]));
-  if (toneHistoryCount < (int)(sizeof(toneHistory) / sizeof(toneHistory[0]))) {
-    toneHistoryCount++;
-  }
-}
-
-void closeToneSegment(unsigned long now) {
-  if (toneSegState != TONE_SEGMENT_ACTIVE) {
-    return;
-  }
-  currentToneSegment.endMs = now;
-  unsigned long dur = currentToneSegment.endMs - currentToneSegment.startMs;
-  if (dur >= 80 && dur <= 600) {
-    pushToneEvent(currentToneSegment.toneId, now);
-  }
-  toneSegState = TONE_SEGMENT_NONE;
-  currentToneSegment.toneId = TONE_NONE;
-}
-
-void processToneSegment(AudioToneId toneId, unsigned long now) {
-  if (toneId == TONE_NONE) {
-    closeToneSegment(now);
-    return;
-  }
-
-  if (toneSegState == TONE_SEGMENT_NONE) {
-    toneSegState = TONE_SEGMENT_ACTIVE;
-    currentToneSegment.toneId = toneId;
-    currentToneSegment.startMs = now;
-    currentToneSegment.endMs = now;
-    return;
-  }
-
-  if (toneSegState == TONE_SEGMENT_ACTIVE) {
-    if (toneId == currentToneSegment.toneId) {
-      currentToneSegment.endMs = now;
-    } else {
-      // Tone changed: close previous and start new.
-      closeToneSegment(now);
-      toneSegState = TONE_SEGMENT_ACTIVE;
-      currentToneSegment.toneId = toneId;
-      currentToneSegment.startMs = now;
-      currentToneSegment.endMs = now;
-    }
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Tone command matcher
+// Frequency command matcher (relative ascending/descending)
 // ---------------------------------------------------------------------------
 void onRecenterCommand() {
   writeText("Recenter", YELLOW);
   calibrateCenter();
   centerYaw = yaw; // Reset yaw drift reference.
-  writeText("3D Mouse", isActivated ? WHITE : RED);
+  isActivated = true;
+  scrollModeActive = false;
+  writeText("3D Mouse", WHITE);
 }
 
-void checkToneCommands() {
-  if (toneHistoryCount == 0) {
+void onRightClickCommand() {
+  if (!bleMouse.isConnected()) {
+    return;
+  }
+  bleMouse.press(MOUSE_RIGHT);
+  bleMouse.release(MOUSE_RIGHT);
+}
+
+void onDeactivateCommand() {
+  isActivated = false;
+  scrollModeActive = false;
+  writeText("3D Mouse", RED);
+}
+
+void pushFreqEvent(float freq, unsigned long timeMs) {
+  freqHistory[freqHistoryIndex] = { freq, timeMs };
+  freqHistoryIndex = (freqHistoryIndex + 1) % (int)(sizeof(freqHistory) / sizeof(freqHistory[0]));
+  if (freqHistoryCount < (int)(sizeof(freqHistory) / sizeof(freqHistory[0]))) {
+    freqHistoryCount++;
+  }
+  if (ENABLE_AUDIO_SERIAL_DEBUG) {
+    static unsigned long lastSerial = 0;
+    if (millis() - lastSerial > 100) {
+      Serial.printf("[FreqEvent] f=%.1f time=%lu\n", freq, timeMs);
+      lastSerial = millis();
+    }
+  }
+}
+
+void checkFrequencyCommands() {
+  if (freqHistoryCount < 2) {
     return;
   }
 
-  for (int cmdIdx = 0; cmdIdx < g_numAudioCommands; ++cmdIdx) {
-    const AudioToneCommand& cmd = g_audioCommands[cmdIdx];
-    int seqIdx = cmd.length - 1;
-    int historyChecked = 0;
-    unsigned long newestTime = 0;
-    unsigned long oldestTime = 0;
+  auto getEvent = [&](int recentIdx) -> FreqEvent {
+    int idx = (freqHistoryIndex - 1 - recentIdx + (int)(sizeof(freqHistory) / sizeof(freqHistory[0]))) % (int)(sizeof(freqHistory) / sizeof(freqHistory[0]));
+    return freqHistory[idx];
+  };
 
-    for (int h = toneHistoryCount - 1; h >= 0 && seqIdx >= 0; --h) {
-      int idx = (toneHistoryIndex - 1 - historyChecked + (int)(sizeof(toneHistory) / sizeof(toneHistory[0]))) % (int)(sizeof(toneHistory) / sizeof(toneHistory[0]));
-      historyChecked++;
-      if (toneHistory[idx].toneId == cmd.sequence[seqIdx]) {
-        if (seqIdx == cmd.length - 1) {
-          newestTime = toneHistory[idx].timeMs;
+  auto withinSpacing = [&](const FreqEvent& newer, const FreqEvent& older) -> bool {
+    return (newer.time - older.time) <= 800;
+  };
+
+  // Two-tone ascending for right click.
+  if (freqHistoryCount >= 2) {
+    FreqEvent e1 = getEvent(1);
+    FreqEvent e0 = getEvent(0);
+    if (withinSpacing(e0, e1) && e0.freq > e1.freq * 1.20f) { // Note: e1 is older than e0
+      onRightClickCommand();
+      if (ENABLE_AUDIO_SERIAL_DEBUG) {
+        static unsigned long lastSerial = 0;
+        if (millis() - lastSerial > 100) {
+          Serial.println("[FreqCmd] Ascending 2-tone -> Right click");
+          lastSerial = millis();
         }
-        oldestTime = toneHistory[idx].timeMs;
-        seqIdx--;
       }
+      freqHistoryCount = 0;
+      freqHistoryIndex = 0;
+      return;
     }
+  }
 
-    if (seqIdx < 0) {
-      unsigned long duration = newestTime - oldestTime;
-      if (duration <= cmd.maxTotalDurationMs) {
-        if (cmd.callback) {
-          cmd.callback();
+  // Three-tone ascending for recenter; descending for deactivate.
+  if (freqHistoryCount >= 3) {
+    FreqEvent e2 = getEvent(2);
+    FreqEvent e1 = getEvent(1);
+    FreqEvent e0 = getEvent(0);
+    bool spaced = withinSpacing(e1, e2) && withinSpacing(e0, e1);
+    if (spaced) {
+      bool ascending = (e1.freq > e2.freq * 1.20f) && (e0.freq > e1.freq * 1.20f);
+      bool descending = (e1.freq < e2.freq * 0.80f) && (e0.freq < e1.freq * 0.80f);
+      if (ascending) {
+        onRecenterCommand();
+        if (ENABLE_AUDIO_SERIAL_DEBUG) {
+          static unsigned long lastSerial = 0;
+          if (millis() - lastSerial > 100) {
+            Serial.println("[FreqCmd] Ascending 3-tone -> Recenter+Activate");
+            lastSerial = millis();
+          }
         }
-        toneHistoryCount = 0; // Clear to avoid retrigger loops.
-        toneHistoryIndex = 0;
+        freqHistoryCount = 0;
+        freqHistoryIndex = 0;
+        return;
+      } else if (descending) {
+        onDeactivateCommand();
+        if (ENABLE_AUDIO_SERIAL_DEBUG) {
+          static unsigned long lastSerial = 0;
+          if (millis() - lastSerial > 100) {
+            Serial.println("[FreqCmd] Descending 3-tone -> Deactivate");
+            lastSerial = millis();
+          }
+        }
+        freqHistoryCount = 0;
+        freqHistoryIndex = 0;
         return;
       }
     }
@@ -594,18 +566,9 @@ void checkToneCommands() {
 // Impulse detector for clicks and scroll activation
 // ---------------------------------------------------------------------------
 void handleShortImpulse(unsigned long now) {
-  if (!bleMouse.isConnected() || !isActivated) {
-    return;
-  }
-  if (now - lastShortImpulseTime < doubleClickWindowMs) {
-    bleMouse.press(MOUSE_RIGHT);
-    bleMouse.release(MOUSE_RIGHT);
-    lastShortImpulseTime = 0; // Reset to avoid triple counting.
-  } else {
-    bleMouse.press(MOUSE_LEFT);
-    bleMouse.release(MOUSE_LEFT);
-    lastShortImpulseTime = now;
-  }
+  if (!bleMouse.isConnected() || !isActivated) return;
+  bleMouse.press(MOUSE_LEFT);
+  bleMouse.release(MOUSE_LEFT);
 }
 
 void handleLongBlow(unsigned long now) {
@@ -616,7 +579,7 @@ void handleLongBlow(unsigned long now) {
 void processImpulse(float effectiveLevel, unsigned long now) {
   switch (impulseState) {
     case AUDIO_IMPULSE_IDLE:
-      if (effectiveLevel > audioThreshold) {
+      if (effectiveLevel > audioThreshold && (now - lastImpulseEventMs) > impulseRefractoryMs) {
         impulseState = AUDIO_IMPULSE_ACTIVE;
         impulseStartMs = now;
         impulsePeakLevel = effectiveLevel;
@@ -633,6 +596,7 @@ void processImpulse(float effectiveLevel, unsigned long now) {
         } else if (duration >= longEventMinMs) {
           handleLongBlow(now);
         }
+        lastImpulseEventMs = now;
         impulseState = AUDIO_IMPULSE_IDLE;
       }
       break;
@@ -659,13 +623,23 @@ void updateAudioControl() {
   }
 
   unsigned long now = millis();
-  AudioToneId toneId = detectTone(audioBuffer, sampleCount);
-  bool hasTone = (toneId != TONE_NONE);
+  float dominantFreq = 0.0f;
+  if (stats.rms > toneMinRms) {
+    dominantFreq = detectDominantFrequency(audioBuffer, sampleCount);
+  }
+  bool hasTone = (dominantFreq > 0.0f);
+
+  if (ENABLE_AUDIO_SERIAL_DEBUG) {
+    static unsigned long lastSerial = 0;
+    if (millis() - lastSerial > 100) {
+      Serial.printf("[Audio] rms=%.1f eff=%.1f nf=%.1f samples=%u freq=%.1f hasTone=%d\n",
+                    stats.rms, effectiveLevel, noiseFloor, (unsigned)sampleCount, dominantFreq, hasTone ? 1 : 0);
+      lastSerial = millis();
+    }
+  }
 
   if (hasTone) {
-    processToneSegment(toneId, now);
-  } else {
-    processToneSegment(TONE_NONE, now);
+    pushFreqEvent(dominantFreq, now);
   }
 
   if (!hasTone) {
@@ -688,13 +662,15 @@ void updateAudioControl() {
     }
   }
 
-  checkToneCommands();
+  if (hasTone) {
+    checkFrequencyCommands();
+  }
 
   if (ENABLE_AUDIO_DEBUG && ENABLE_DEBUG_DISPLAY) {
     M5.Display.setCursor(0, 90);
     M5.Display.setTextColor(GREEN, BLACK);
     M5.Display.printf("RMS:%.1f eff:%.1f NF:%.1f\n", stats.rms, effectiveLevel, noiseFloor);
-    M5.Display.printf("Tone:%d Imp:%d Scroll:%d\n", (int)toneId, (int)impulseState, scrollModeActive ? 1 : 0);
+    M5.Display.printf("Freq:%.0f Imp:%d Scroll:%d\n", dominantFreq, (int)impulseState, scrollModeActive ? 1 : 0);
   }
 }
 
@@ -731,7 +707,7 @@ void setup() {
   M5.Display.setRotation(2);
   M5.Display.setBrightness(200);
   M5.Display.fillScreen(BLACK);
-  writeText("3D Mouse", WHITE);
+  writeText("3D Mouse", isActivated ? WHITE : RED);
 
   bleMouse.begin();
   left_button_last_state = digitalRead(LEFT_BUTTON);
@@ -748,13 +724,21 @@ void setup() {
   micCfg.dma_buf_count = 4;
   M5.Mic.config(micCfg);
   audioInputReady = M5.Mic.begin();
+
+  if (ENABLE_AUDIO_SERIAL_DEBUG) {
+    Serial.begin(115200);
+    Serial.setTxBufferSize(1024);
+    Serial.println("[Init] Serial debug for audio enabled.");
+  }
 }
 
 void loop() {
   M5.update();
   handleHomeButton();
   updateMouseFromHead();
-  updateAudioControl(); // Audio gestures and tone commands.
+  if (ALLOW_AUDIO_COMMANDS) {
+    updateAudioControl(); // Audio gestures and tone commands.
+  }
 
   if (bleMouse.isConnected() && isActivated) {
     if (M5.BtnB.wasReleased()) {
