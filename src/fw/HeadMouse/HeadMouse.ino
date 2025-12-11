@@ -89,8 +89,27 @@ int left_button_last_state = 0;
 int right_button_last_state = 0;
 
 String lcdText = " ";
+String sensitivityStatusText = "";
 
 BleMouse bleMouse;
+
+// Sensitivity presets toggled by the side button.
+struct SensitivityProfile {
+  float pitch;
+  float roll;
+  float yaw;
+  float maxStep;
+  const char* label;
+  uint16_t color;
+};
+
+const SensitivityProfile kSensitivityProfiles[] = {
+  {0.15f, 0.15f, 0.10f, 8.0f, "LOW", BLUE},
+  {0.30f, 0.30f, 0.20f, 12.0f, "MED", GREEN},
+  {0.50f, 0.50f, 0.35f, 15.0f, "HIGH", YELLOW},
+};
+const int kSensitivityProfileCount = sizeof(kSensitivityProfiles) / sizeof(kSensitivityProfiles[0]);
+int currentSensitivityIndex = 1; // Default to the middle (matches original tuning).
 
 // ---------------------------------------------------------------------------
 // Audio configuration and state
@@ -146,6 +165,35 @@ int16_t audioBuffer[AUDIO_BLOCK_SAMPLES];
 // ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
+void showSensitivityStatus(const char* label, uint16_t color) {
+  String text = String("Sensitivity: ") + label;
+  M5.Display.setTextColor(BLACK);
+  M5.Display.setCursor(0, 0);
+  M5.Display.println(sensitivityStatusText);
+  M5.Display.setTextColor(color);
+  M5.Display.setCursor(0, 0);
+  M5.Display.println(text);
+  sensitivityStatusText = text;
+}
+
+void applySensitivityProfile(int index) {
+  if (index < 0 || index >= kSensitivityProfileCount) {
+    return;
+  }
+  const auto& profile = kSensitivityProfiles[index];
+  sensitivityPitch = profile.pitch;
+  sensitivityRoll = profile.roll;
+  sensitivityYaw = profile.yaw;
+  maxStepPerUpdate = profile.maxStep;
+  currentSensitivityIndex = index;
+  showSensitivityStatus(profile.label, profile.color);
+}
+
+void cycleSensitivityProfile() {
+  int next = (currentSensitivityIndex + 1) % kSensitivityProfileCount;
+  applySensitivityProfile(next);
+}
+
 void writeText(const String &text, int color) {
   M5.Display.setTextColor(BLACK);
   M5.Display.setCursor(0, 80);
@@ -306,6 +354,12 @@ void handleHomeButton() {
       writeText("3D Mouse", isActivated ? WHITE : RED);
     }
     homeHoldTriggered = false;
+  }
+}
+
+void handleSensitivityButton() {
+  if (M5.BtnB.wasReleased()) {
+    cycleSensitivityProfile();
   }
 }
 
@@ -708,6 +762,7 @@ void setup() {
   M5.Display.setBrightness(200);
   M5.Display.fillScreen(BLACK);
   writeText("3D Mouse", isActivated ? WHITE : RED);
+  applySensitivityProfile(currentSensitivityIndex);
 
   bleMouse.begin();
   left_button_last_state = digitalRead(LEFT_BUTTON);
@@ -735,17 +790,13 @@ void setup() {
 void loop() {
   M5.update();
   handleHomeButton();
+  handleSensitivityButton();
   updateMouseFromHead();
   if (ALLOW_AUDIO_COMMANDS) {
     updateAudioControl(); // Audio gestures and tone commands.
   }
 
   if (bleMouse.isConnected() && isActivated) {
-    if (M5.BtnB.wasReleased()) {
-      bleMouse.press(MOUSE_MIDDLE);
-      bleMouse.release(MOUSE_MIDDLE);
-    }
-
     int left_button_actual_state = digitalRead(LEFT_BUTTON);
     int right_button_actual_state = digitalRead(RIGHT_BUTTON);
 
