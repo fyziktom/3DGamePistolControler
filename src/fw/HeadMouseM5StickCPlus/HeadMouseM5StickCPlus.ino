@@ -5,10 +5,6 @@
 #include <BleMouse.h>
 #include <math.h>
 
-#ifndef M5_LED
-#define M5_LED 10
-#endif
-
 // Enable to show debug info directly on the M5StickC display.
 #define ENABLE_DEBUG_DISPLAY false
 
@@ -308,7 +304,6 @@ void handleHomeButton() {
       // Short press -> toggle head-mouse activation.
       isActivated = !isActivated;
       writeText("HeadMouse", isActivated ? WHITE : RED);
-      digitalWrite(M5_LED, isActivated ? HIGH : LOW);
     }
     homeHoldTriggered = false;
   }
@@ -386,9 +381,6 @@ void setup() {
   cfg.external_display.module_rca     = false;
 
   M5.begin(cfg);
-
-  pinMode(M5_LED, OUTPUT);
-  digitalWrite(M5_LED, LOW);
 
   pinMode(LEFT_BUTTON, INPUT);
   pinMode(RIGHT_BUTTON, INPUT);
