@@ -316,6 +316,8 @@ void handleExternalMouseButtons() {
 
 void setup() {
   auto cfg = M5.config();
+  cfg.internal_imu  = true;
+  cfg.internal_rtc  = true;
   cfg.internal_mic = false;   // Microphone not used in this version.
   cfg.internal_spk = false;
   cfg.clear_display = true;
@@ -353,6 +355,10 @@ void setup() {
 
   // Initial gyro calibration; keep your head still during boot.
   calibrateGyroBias();
+
+  M5.Display.fillScreen(BLACK);
+  writeText("Done. Starting...", WHITE);
+  delay(2000);
 }
 
 void loop() {
