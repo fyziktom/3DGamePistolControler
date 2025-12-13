@@ -46,6 +46,8 @@ const int RIGHT_BUTTON = 32;
 #define HEADMOUSE_INVERT_Y 0
 #endif
 
+static constexpr gpio_num_t HOLD_PIN = GPIO_NUM_4;
+
 // Gyro tuning parameters.
 float gyroDeadzoneDps = 1.5f;        // Angular speed in deg/s below which movement is ignored.
 float gyroSensitivityX = 20.0f;      // Mouse pixels per (deg/s * second) on X.
@@ -153,32 +155,57 @@ void updateDebugDisplay(float rawRateX, float rawRateY, int dx, int dy) {
 // Gyro calibration and head-mouse logic
 // ---------------------------------------------------------------------------
 
-void calibrateGyroBias() {
-  // Average a number of gyro samples while the device is stationary.
-  const int samples = 400;
-  float sumX = 0.0f;
-  float sumY = 0.0f;
-  float sumZ = 0.0f;
+bool ensureImuReady() {
+  // If already initialized by M5.begin(cfg), just accept it.
+  if (M5.Imu.isEnabled()) return true;
+
+  // Try explicit init on internal I2C with the selected board.
+  // Note: board type helps choose IMU driver (MPU6886/SH200Q/BMI270...).
+  bool ok = M5.Imu.begin(&M5.In_I2C, M5.getBoard());
+  return ok && M5.Imu.isEnabled();
+}
+
+bool calibrateGyroBias() {
+  // Calibrate with progress + time limit to avoid "stuck forever" feel.
+  const int targetSamples = 200;
+  const uint32_t maxCalMs = 3000;   // Hard limit (ms)
+  int got = 0;
+
+  float sumX = 0, sumY = 0, sumZ = 0;
+  uint32_t start = millis();
 
   writeText("Calibrating...", YELLOW);
 
-  for (int i = 0; i < samples; ++i) {
+  while (got < targetSamples && (millis() - start) < maxCalMs) {
     float gx, gy, gz;
     if (M5.Imu.getGyro(&gx, &gy, &gz)) {
       sumX += gx;
       sumY += gy;
       sumZ += gz;
+      got++;
     }
+
+    // Show progress every ~20 samples so user sees it's alive.
+    if ((got % 20) == 0) {
+      M5.Display.setCursor(0, 100);
+      M5.Display.setTextColor(WHITE, BLACK);
+      M5.Display.printf("IMU type: %d\n", (int)M5.Imu.getType());
+      M5.Display.printf("Samples: %d/%d\n", got, targetSamples);
+    }
+
     delay(2);
   }
 
-  gyroBiasX = sumX / samples;
-  gyroBiasY = sumY / samples;
-  gyroBiasZ = sumZ / samples;
+  if (got < 20) {
+    // Not enough valid samples -> treat as failure.
+    return false;
+  }
 
+  gyroBiasX = sumX / got;
+  gyroBiasY = sumY / got;
+  gyroBiasZ = sumZ / got;
   lastUpdateMs = millis();
-
-  writeText("HeadMouse", isActivated ? WHITE : RED);
+  return true;
 }
 
 // Main head-mouse update: convert gyro rotation speed into mouse movement.
@@ -322,7 +349,7 @@ void setup() {
   cfg.internal_spk = false;
   cfg.clear_display = true;
   cfg.output_power = true;
-  cfg.fallback_board = m5::board_t::board_M5StickCPlus;
+  cfg.fallback_board = m5::board_t::board_M5StickCPlus2;
 
   // Disable external displays.
   cfg.external_display.module_display = false;
@@ -336,6 +363,9 @@ void setup() {
   cfg.external_display.module_rca     = false;
 
   M5.begin(cfg);
+
+  pinMode(HOLD_PIN, OUTPUT);
+  digitalWrite(HOLD_PIN, HIGH);
 
   pinMode(M5_LED, OUTPUT);
   digitalWrite(M5_LED, LOW);
@@ -353,8 +383,18 @@ void setup() {
   left_button_last_state  = digitalRead(LEFT_BUTTON);
   right_button_last_state = digitalRead(RIGHT_BUTTON);
 
+  if (!ensureImuReady()) {
+    M5.Display.fillScreen(BLACK);
+    writeText("Cannot init IMU!", RED);
+    delay(2000);
+  }
+
   // Initial gyro calibration; keep your head still during boot.
-  calibrateGyroBias();
+  if (!calibrateGyroBias()) {
+    M5.Display.fillScreen(BLACK);
+    writeText("Cannot calibrate IMU!", RED);
+    delay(2000);
+  }
 
   M5.Display.fillScreen(BLACK);
   writeText("Done. Starting...", WHITE);
