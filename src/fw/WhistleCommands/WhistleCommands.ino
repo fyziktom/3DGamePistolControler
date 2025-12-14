@@ -1,6 +1,10 @@
 #include <M5Unified.h>
 #include "WhistleCommands.h"
 
+
+// Optional: Plus2 "HOLD" pin (keeps power on after wake). Safe to set only on Plus2.
+static constexpr uint8_t PLUS2_HOLD_PIN = 4;
+
 // ---------------------------------------------------------------------------
 // Example callbacks for detected tone sequences.
 // Replace these with integration hooks (e.g., toggle activation, send clicks).
@@ -46,8 +50,14 @@ void setup() {
   m5cfg.internal_spk   = false;
   m5cfg.clear_display  = true;
   m5cfg.output_power   = true;
-  m5cfg.fallback_board = m5::board_t::board_M5StickC;
+  m5cfg.fallback_board = m5::board_t::board_M5StickCPlus2;
   M5.begin(m5cfg);
+  
+  // Plus2: keep power on after wake (safe to do only when detected).
+  if (M5.getBoard() == m5::board_t::board_M5StickCPlus2) {
+    pinMode(PLUS2_HOLD_PIN, OUTPUT);
+    digitalWrite(PLUS2_HOLD_PIN, HIGH);
+  }
 
   M5.Display.setRotation(3);
   M5.Display.setBrightness(180);
