@@ -21,12 +21,17 @@ static void onCopy(int, const char*, const char*, const float*, const float*, ui
   Serial.println("[CMD] Ctrl+C");
 }
 
+static void onPaste(int, const char*, const char*, const float*, const float*, uint8_t) {
+  Serial.println("[CMD] Ctrl+V");
+}
+
 // Map tone patterns to callbacks.
 static const WhistleCommandDef kCommands[] = {
   { 1, "Recalibrate", "BUU",  onRecalibrate },
   { 2, "Deactivate",  "BDD",  onDeactivate  },
   { 3, "RightClick",  "BU",   onRightClick  },
-  { 4, "Ctrl+C",      "BUUB", onCopy        },
+  { 4, "Ctrl+C",      "BUBU", onCopy        },
+  { 4, "Ctrl+V",      "BDBD", onPaste        },
 };
 
 WhistleCommands g_whistle;
@@ -53,14 +58,14 @@ void setup() {
   wc.skipM5Begin   = true;   // Already initialized above.
   wc.callM5Update  = false;  // Main loop calls M5.update().
   wc.configureMic  = true;   // Let module set up/enable the mic.
-  wc.enableGraphs  = false;  // Keep display free for the main UI.
+  wc.enableGraphs  = true;  // Keep display free for the main UI.
   wc.enableOverlay = false;
   wc.display       = static_cast<LGFX_Device*>(&M5.Display);
   wc.commands      = kCommands;
   wc.commandCount  = sizeof(kCommands) / sizeof(kCommands[0]);
   wc.onCommand     = nullptr;  // Optional extra hook after per-command callbacks.
   wc.initSerial    = false;    // Serial already initialized.
-
+  wc.enablePeriodicSerialDebug = false;
   if (!g_whistle.begin(wc)) {
     Serial.println("[BOOT] Whistle init failed, halting.");
     while (true) { delay(1000); }

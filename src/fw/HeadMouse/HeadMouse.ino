@@ -7,6 +7,7 @@
 #include <BleMouse.h>
 #include <BLEDevice.h>   // BLEDevice::startAdvertising()
 #include <math.h>
+#include "WhistleCommands.h"
 
 // ------------------------------------------------------------
 // User toggles
@@ -52,6 +53,11 @@ static constexpr uint8_t PLUS2_HOLD_PIN = 4;
 #ifndef HEADMOUSE_INVERT_Y
 #define HEADMOUSE_INVERT_Y 0
 #endif
+
+// ------------------------------------------------------------
+// Tone commands
+// ------------------------------------------------------------
+WhistleCommands g_whistle;
 
 // ------------------------------------------------------------
 // Mouse tuning
@@ -480,6 +486,59 @@ void handleExternalMouseButtons() {
   }
 }
 
+//-------------------------------------------------------------
+// Callbacks for tone commands
+//-------------------------------------------------------------
+static void onRecalibrate(int, const char*, const char*, const float*, const float*, uint8_t) {
+  Serial.println("[CMD] Recalibrate");
+  Serial.println("[CMD] Calibrating gyro bias...");
+  calibrateGyroBias();
+  if (!isActivated) {
+    toggleActivation();
+  }
+}
+
+static void onDeactivate(int, const char*, const char*, const float*, const float*, uint8_t) {
+  Serial.println("[CMD] Deactivate");
+    if (isActivated) {
+    toggleActivation();
+  }
+}
+
+static void onLeftClick(int, const char*, const char*, const float*, const float*, uint8_t) {
+  Serial.println("[CMD] Left click");
+  bleMouse.press(MOUSE_LEFT);
+  bleMouse.release(MOUSE_LEFT);
+}
+
+static void onRightClick(int, const char*, const char*, const float*, const float*, uint8_t) {
+  Serial.println("[CMD] Right click");
+  bleMouse.press(MOUSE_RIGHT);
+  bleMouse.release(MOUSE_RIGHT);
+}
+
+static void onCopy(int, const char*, const char*, const float*, const float*, uint8_t) {
+  Serial.println("[CMD] Ctrl+C");
+}
+
+static void onPaste(int, const char*, const char*, const float*, const float*, uint8_t) {
+  Serial.println("[CMD] Ctrl+V");
+}
+
+
+// ------------------------------------------------------------
+// Tone commands mapping
+// ------------------------------------------------------------
+
+static const WhistleCommandDef kCommands[] = {
+  { 1, "Recalibrate", "BUU",  onRecalibrate },
+  { 2, "Deactivate",  "BDD",  onDeactivate  },
+  { 3, "LeftClick",  "BB",   onLeftClick  },
+  { 4, "RightClick",  "BU",   onRightClick  },
+  { 5, "Ctrl+C",      "BUBU", onCopy        },
+  { 6, "Ctrl+V",      "BDBD", onPaste        },
+};
+
 // ------------------------------------------------------------
 // Setup / loop
 // ------------------------------------------------------------
@@ -493,7 +552,7 @@ void setup() {
 
   auto cfg = M5.config();
   cfg.internal_imu  = true;
-  cfg.internal_mic  = false;
+  cfg.internal_mic  = true;
   cfg.internal_spk  = false;
   cfg.clear_display = true;
   cfg.output_power  = true;
@@ -560,12 +619,32 @@ void setup() {
   left_button_last_state  = digitalRead(LEFT_BUTTON);
   right_button_last_state = digitalRead(RIGHT_BUTTON);
 
+    // Configure whistle commands to reuse existing init and disable graphs/overlay.
+  WhistleCommandsConfig wc;
+  wc.skipM5Begin   = true;   // Already initialized above.
+  wc.callM5Update  = false;  // Main loop calls M5.update().
+  wc.configureMic  = true;   // Let module set up/enable the mic.
+  wc.enableGraphs  = false;  // Keep display free for the main UI.
+  wc.enableOverlay = false;
+  wc.display       = static_cast<LGFX_Device*>(&M5.Display);
+  wc.commands      = kCommands;
+  wc.commandCount  = sizeof(kCommands) / sizeof(kCommands[0]);
+  wc.onCommand     = nullptr;  // Optional extra hook after per-command callbacks.
+  wc.initSerial    = false;    // Serial already initialized.
+  wc.enablePeriodicSerialDebug = false;
+  if (!g_whistle.begin(wc)) {
+    Serial.println("[BOOT] Whistle init failed, halting.");
+    while (true) { delay(1000); }
+  }
+
   setEvent("Ready", WHITE, 1200);
   drawHud(true);
 }
 
 void loop() {
   M5.update();
+
+  g_whistle.update();
 
   // BLE state + advertising recovery
   handleBleRecovery();
