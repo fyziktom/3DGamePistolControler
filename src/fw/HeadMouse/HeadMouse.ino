@@ -1,45 +1,50 @@
-// HeadMouse with gyro-based "real mouse" behaviour on M5StickC (ESP32)
-// Uses M5Unified for IMU and display, and BleMouse for Bluetooth HID mouse.
+// HeadMouse with gyro-based "real mouse" behaviour on M5StickC-family (ESP32)
+// Uses M5Unified for IMU+display and BleMouse for BLE HID mouse.
+// Includes BLE advertising recovery after disconnect and a friendly status HUD.
+// NOTE: All comments are intentionally in English.
 
 #include <M5Unified.h>
 #include <BleMouse.h>
+#include <BLEDevice.h>   // BLEDevice::startAdvertising()
 #include <math.h>
 
-// Enable to show debug info directly on the M5StickC display.
+// ------------------------------------------------------------
+// User toggles
+// ------------------------------------------------------------
 #define ENABLE_DEBUG_DISPLAY false
 
-// External buttons used as mouse buttons.
+// ------------------------------------------------------------
+// Pins / HW
+// ------------------------------------------------------------
+// External buttons used as mouse buttons (Grove port on StickC-family).
 const int LEFT_BUTTON  = 33;
 const int RIGHT_BUTTON = 32;
 
-// Reduce I2C/IMU clock to improve stability on some PLUS2 boards.
+// Reduce I2C/IMU clock to improve stability on some boards.
 static constexpr uint32_t IMU_CLOCK_HZ = 100000;
-// Slow down sampling to reduce I2C stress (mouse still feels fine at 100-200 Hz).
+
+// Loop speed (100–200 Hz is enough for a mouse and reduces I2C stress).
 static constexpr uint8_t LOOP_DELAY_MS  = 5;
 static constexpr uint8_t CALIB_DELAY_MS = 5;
 
-// Gyro axis identifiers.
+// Optional: Plus2 "HOLD" pin (keeps power on after wake). Safe to set only on Plus2.
+static constexpr uint8_t PLUS2_HOLD_PIN = 4;
+
+// ------------------------------------------------------------
+// Axis mapping
+// ------------------------------------------------------------
 #define GYRO_AXIS_X 0
 #define GYRO_AXIS_Y 1
 #define GYRO_AXIS_Z 2
 
-// Axis mapping: which gyro axes drive mouse X/Y velocity.
-// You can override these from the build flags or before including this file.
 #ifndef HEADMOUSE_GYRO_AXIS_X
-#define HEADMOUSE_GYRO_AXIS_X GYRO_AXIS_Z   // Default: yaw (turning head) moves mouse horizontally.
-#define HEADMOUSE_GYRO_AXIS_X_IS_DEFAULT 1
-#else
-#define HEADMOUSE_GYRO_AXIS_X_IS_DEFAULT 0
+#define HEADMOUSE_GYRO_AXIS_X GYRO_AXIS_Z   // Default: yaw -> mouse X
 #endif
 
 #ifndef HEADMOUSE_GYRO_AXIS_Y
-#define HEADMOUSE_GYRO_AXIS_Y GYRO_AXIS_Y   // Default: pitch (nodding) moves mouse vertically.
-#define HEADMOUSE_GYRO_AXIS_Y_IS_DEFAULT 1
-#else
-#define HEADMOUSE_GYRO_AXIS_Y_IS_DEFAULT 0
+#define HEADMOUSE_GYRO_AXIS_Y GYRO_AXIS_Y   // Default: pitch -> mouse Y
 #endif
 
-// Invert directions if needed (1 = invert, 0 = normal).
 #ifndef HEADMOUSE_INVERT_X
 #define HEADMOUSE_INVERT_X 1
 #endif
@@ -48,216 +53,322 @@ static constexpr uint8_t CALIB_DELAY_MS = 5;
 #define HEADMOUSE_INVERT_Y 0
 #endif
 
-// Gyro tuning parameters.
-float gyroDeadzoneDps = 1.5f;        // Angular speed in deg/s below which movement is ignored.
-float gyroSensitivityX = 20.0f;      // Mouse pixels per (deg/s * second) on X.
-float gyroSensitivityY = 20.0f;      // Mouse pixels per (deg/s * second) on Y.
-float maxStepPerUpdate = 25.0f;      // Maximum mouse pixels per update on each axis.
+// ------------------------------------------------------------
+// Mouse tuning
+// ------------------------------------------------------------
+float gyroDeadzoneDps  = 1.5f;
+float gyroSensitivityX = 20.0f;
+float gyroSensitivityY = 20.0f;
+float maxStepPerUpdate = 25.0f;
 
-// Gyro bias (offset) to compensate for sensor drift when device is stationary.
+// Gyro bias
 float gyroBiasX = 0.0f;
 float gyroBiasY = 0.0f;
 float gyroBiasZ = 0.0f;
 
-// Time bookkeeping for integration.
+// Integration time
 unsigned long lastUpdateMs = 0;
 
-// Activation and button handling.
-bool isActivated = false;            // When false, head movement does not move the mouse.
-bool homeHoldTriggered = false;
-unsigned long homePressStart = 0;
+// Activation state
+bool isActivated = false;
 
+// External button state
 int left_button_last_state  = 0;
 int right_button_last_state = 0;
 
-// Simple text status on display.
-String lcdText = " ";
-String sensitivityStatusText = "";
-
-// BLE mouse instance.
+// BLE mouse instance
 BleMouse bleMouse;
 
-// Sensitivity presets toggled by side button (BtnB).
+// ------------------------------------------------------------
+// Sensitivity presets
+// ------------------------------------------------------------
 struct SensitivityProfile {
   float gainX;
   float gainY;
   float maxStep;
   const char* label;
-  uint16_t color;
 };
 
 const SensitivityProfile kSensitivityProfiles[] = {
-  {10.0f, 10.0f, 15.0f, "LOW",  BLUE},
-  {20.0f, 20.0f, 25.0f, "MED",  GREEN},
-  {35.0f, 35.0f, 30.0f, "HIGH", YELLOW},
+  {10.0f, 10.0f, 15.0f, "LOW"},
+  {20.0f, 20.0f, 25.0f, "MED"},
+  {35.0f, 35.0f, 30.0f, "HIGH"},
 };
-
 const int kSensitivityProfileCount =
     sizeof(kSensitivityProfiles) / sizeof(kSensitivityProfiles[0]);
-int currentSensitivityIndex = 1;   // Start with "MED" profile.
+int currentSensitivityIndex = 1;
 
-// ---------------------------------------------------------------------------
-// Display helpers
-// ---------------------------------------------------------------------------
+// ------------------------------------------------------------
+// HUD / UI state
+// ------------------------------------------------------------
+enum BleUiState : uint8_t {
+  BLE_UI_BOOTING = 0,
+  BLE_UI_ADVERTISING = 1,
+  BLE_UI_CONNECTED = 2
+};
 
-void showSensitivityStatus(const char* label, uint16_t color) {
-  String text = String("Sensitivity: ") + label;
-  M5.Display.setTextColor(BLACK);
-  M5.Display.setCursor(0, 0);
-  M5.Display.println(sensitivityStatusText);
-  M5.Display.setTextColor(color);
-  M5.Display.setCursor(0, 0);
-  M5.Display.println(text);
-  sensitivityStatusText = text;
-}
+BleUiState bleUiState = BLE_UI_BOOTING;
 
+bool lastBleConnected = false;
+unsigned long bleStartMs = 0;
+unsigned long lastAdvKickMs = 0;
+
+static constexpr unsigned long BLE_BOOT_GRACE_MS     = 2000;  // Let BLE task init before kicking advertising
+static constexpr unsigned long ADV_KICK_PERIOD_MS    = 4000;  // Periodic advertising kick while disconnected
+static constexpr unsigned long HUD_REFRESH_MS        = 150;   // UI refresh interval
+static constexpr unsigned long EVENT_DEFAULT_MS      = 1500;  // Default event message lifetime
+
+// Calibration status for HUD
+bool g_isCalibrating = false;
+int  g_calibGot = 0;
+int  g_calibTarget = 0;
+
+// Event line
+String g_eventText = "";
+uint16_t g_eventColor = WHITE;
+unsigned long g_eventUntilMs = 0;
+
+unsigned long g_lastHudDrawMs = 0;
+bool g_hudDirty = true;
+
+// ------------------------------------------------------------
+// Helpers: sensitivity / activation / events
+// ------------------------------------------------------------
 void applySensitivityProfile(int index) {
-  if (index < 0 || index >= kSensitivityProfileCount) {
-    return;
-  }
-  const auto& profile = kSensitivityProfiles[index];
-  gyroSensitivityX = profile.gainX;
-  gyroSensitivityY = profile.gainY;
-  maxStepPerUpdate = profile.maxStep;
+  if (index < 0 || index >= kSensitivityProfileCount) return;
+  const auto& p = kSensitivityProfiles[index];
+  gyroSensitivityX = p.gainX;
+  gyroSensitivityY = p.gainY;
+  maxStepPerUpdate = p.maxStep;
   currentSensitivityIndex = index;
-  showSensitivityStatus(profile.label, profile.color);
+  g_hudDirty = true;
 }
 
 void cycleSensitivityProfile() {
   int next = (currentSensitivityIndex + 1) % kSensitivityProfileCount;
   applySensitivityProfile(next);
+  // Event message
+  g_eventText = String("Sensitivity: ") + kSensitivityProfiles[currentSensitivityIndex].label;
+  g_eventColor = CYAN;
+  g_eventUntilMs = millis() + EVENT_DEFAULT_MS;
+  g_hudDirty = true;
 }
 
-void writeText(const String& text, int color) {
-  M5.Display.setTextColor(BLACK);
-  M5.Display.setCursor(0, 80);
-  M5.Display.println(lcdText);
-  M5.Display.setTextColor(color);
-  M5.Display.setCursor(0, 80);
-  M5.Display.println(text);
-  lcdText = text;
+void toggleActivation() {
+  isActivated = !isActivated;
+
+  g_eventText = isActivated ? "Movement: ACTIVE" : "Movement: INACTIVE";
+  g_eventColor = isActivated ? GREEN : ORANGE;
+  g_eventUntilMs = millis() + EVENT_DEFAULT_MS;
+  g_hudDirty = true;
 }
 
-void updateDebugDisplay(float rawRateX, float rawRateY, int dx, int dy) {
-  if (!ENABLE_DEBUG_DISPLAY) {
-    return;
+void setEvent(const String& text, uint16_t color, unsigned long durationMs = EVENT_DEFAULT_MS) {
+  g_eventText = text;
+  g_eventColor = color;
+  g_eventUntilMs = (durationMs == 0) ? 0 : (millis() + durationMs);
+  g_hudDirty = true;
+}
+
+// ------------------------------------------------------------
+// HUD drawing
+// ------------------------------------------------------------
+void configureFontForScreen() {
+  // Use bigger font on wider displays, smaller on narrow StickC.
+  if (M5.Display.width() < 120) {
+    M5.Display.setFont(&fonts::Font0);
+    M5.Display.setTextSize(1);
+  } else {
+    M5.Display.setFont(&fonts::Font0);
+    //M5.Display.setFont(&fonts::AsciiFont8x16);
+    M5.Display.setTextSize(1);
   }
-  M5.Display.fillRect(0, 0, 160, 90, BLACK);
-  M5.Display.setCursor(0, 0);
-  M5.Display.setTextColor(WHITE);
-  M5.Display.printf("rateX: %.2f dps\n", rawRateX);
-  M5.Display.printf("rateY: %.2f dps\n", rawRateY);
-  M5.Display.printf("dx/dy: %d / %d\n", dx, dy);
-  M5.Display.printf("active: %d\n", isActivated ? 1 : 0);
 }
 
-// ---------------------------------------------------------------------------
-// Gyro calibration and head-mouse logic
-// ---------------------------------------------------------------------------
+const char* boardShortName(m5::board_t b) {
+  switch (b) {
+    case m5::board_t::board_M5StickC:       return "StickC";
+    case m5::board_t::board_M5StickCPlus:   return "Plus";
+    case m5::board_t::board_M5StickCPlus2:  return "Plus2";
+    default:                                return "M5";
+  }
+}
 
+void drawHud(bool force = false) {
+  unsigned long now = millis();
+  if (!force && !g_hudDirty && (now - g_lastHudDrawMs) < HUD_REFRESH_MS) return;
+  g_lastHudDrawMs = now;
+  g_hudDirty = false;
+
+  configureFontForScreen();
+
+  int w = M5.Display.width();
+  int h = M5.Display.height();
+  int lineH = M5.Display.fontHeight() + 2;
+
+  // Reserve a compact HUD area at the top
+  int hudLines = 5;
+  int hudH = hudLines * lineH + 4;
+
+  // Clear HUD area
+  M5.Display.fillRect(0, 0, w, hudH, BLACK);
+
+  int x = 2;
+  int y = 2;
+
+  // Line 1: Title + board
+  M5.Display.setCursor(x, y);
+  M5.Display.setTextColor(WHITE, BLACK);
+  M5.Display.printf("HeadMouse (%s)", boardShortName(M5.getBoard()));
+  y += lineH;
+
+  // Line 2: BLE state
+  M5.Display.setCursor(x, y);
+  if (bleUiState == BLE_UI_CONNECTED) {
+    M5.Display.setTextColor(GREEN, BLACK);
+    M5.Display.print("BLE: CONNECTED");
+  } else if (bleUiState == BLE_UI_ADVERTISING) {
+    M5.Display.setTextColor(YELLOW, BLACK);
+    M5.Display.print("BLE: ADVERTISING");
+  } else {
+    M5.Display.setTextColor(ORANGE, BLACK);
+    M5.Display.print("BLE: BOOTING");
+  }
+  y += lineH;
+
+  // Line 3: Movement active + connection hint
+  M5.Display.setCursor(x, y);
+  if (isActivated) {
+    M5.Display.setTextColor(CYAN, BLACK);
+    M5.Display.print("MOVE: ACTIVE");
+  } else {
+    M5.Display.setTextColor(WHITE, BLACK);
+    M5.Display.print("MOVE: INACTIVE");
+  }
+
+  // Small hint if user is active but not connected
+  if (isActivated && bleUiState != BLE_UI_CONNECTED) {
+    M5.Display.setTextColor(ORANGE, BLACK);
+    M5.Display.print(" (connect)");
+  }
+  y += lineH;
+
+  // Line 4: Sensitivity
+  M5.Display.setCursor(x, y);
+  M5.Display.setTextColor(WHITE, BLACK);
+  M5.Display.printf("SENS: %s", kSensitivityProfiles[currentSensitivityIndex].label);
+  y += lineH;
+
+  // Line 5: Calibration progress or quick controls
+  M5.Display.setCursor(x, y);
+  if (g_isCalibrating) {
+    M5.Display.setTextColor(YELLOW, BLACK);
+    M5.Display.printf("CAL: %d/%d", g_calibGot, g_calibTarget);
+  } else {
+    M5.Display.setTextColor(DARKGREY, BLACK);
+    M5.Display.print("A: toggle | A-hold: calib | B: sens");
+  }
+
+  // Event message line near bottom (non-intrusive)
+  int eventY = h - lineH - 2;
+  M5.Display.fillRect(0, eventY - 2, w, lineH + 4, BLACK);
+
+  if (g_eventText.length() > 0 && (g_eventUntilMs == 0 || now <= g_eventUntilMs)) {
+    M5.Display.setCursor(2, eventY);
+    M5.Display.setTextColor(g_eventColor, BLACK);
+    M5.Display.print(g_eventText);
+  }
+}
+
+// ------------------------------------------------------------
+// IMU + calibration
+// ------------------------------------------------------------
 bool ensureImuReady() {
-  // If already initialized by M5.begin(cfg), just accept it.
   if (M5.Imu.isEnabled()) return true;
-
-  // Try explicit init on internal I2C with the selected board.
-  // Note: board type helps choose IMU driver (MPU6886/SH200Q/BMI270...).
   bool ok = M5.Imu.begin(&M5.In_I2C, M5.getBoard());
   return ok && M5.Imu.isEnabled();
 }
 
 bool calibrateGyroBias() {
-  // Calibrate with progress + time limit to avoid "stuck forever" feel.
   const int targetSamples = 200;
-  const uint32_t maxCalMs = 5000;   // Hard limit (ms)
-  int got = 0;
+  const uint32_t maxCalMs = 5000;
+
+  g_isCalibrating = true;
+  g_calibGot = 0;
+  g_calibTarget = targetSamples;
+  setEvent("Calibrating gyro...", YELLOW, 0);
 
   float sumX = 0, sumY = 0, sumZ = 0;
   uint32_t start = millis();
   uint32_t lastUi = 0;
 
-  writeText("Calibrating...", YELLOW);
-
-  while (got < targetSamples && (millis() - start) < maxCalMs) {
+  while (g_calibGot < targetSamples && (millis() - start) < maxCalMs) {
     float gx, gy, gz;
     if (M5.Imu.getGyro(&gx, &gy, &gz)) {
       sumX += gx;
       sumY += gy;
       sumZ += gz;
-      got++;
+      g_calibGot++;
     }
 
-    // Show progress every ~20 samples so user sees it's alive.
-    if (millis() - lastUi > 200) {
+    // Refresh HUD periodically
+    if (millis() - lastUi > 100) {
       lastUi = millis();
-      M5.Display.setCursor(0, 100);
-      M5.Display.setTextColor(WHITE, BLACK);
-      M5.Display.printf("IMU type: %d\n", (int)M5.Imu.getType());
-      M5.Display.printf("Samples: %d/%d\n", got, targetSamples);
-      Serial.printf("IMU type: %d\n", (int)M5.Imu.getType());
-      Serial.printf("Samples: %d/%d\n", got, targetSamples);
+      g_hudDirty = true;
+      drawHud(true);
+      Serial.printf("[CAL] IMU type=%d samples=%d/%d\n", (int)M5.Imu.getType(), g_calibGot, targetSamples);
     }
 
     M5.update();
     delay(CALIB_DELAY_MS);
   }
 
-  if (got < 20) {
-    // Not enough valid samples -> treat as failure.
+  g_isCalibrating = false;
+
+  if (g_calibGot < 20) {
+    setEvent("Calibration FAILED", RED, 2500);
+    g_hudDirty = true;
     return false;
   }
 
-  gyroBiasX = sumX / got;
-  gyroBiasY = sumY / got;
-  gyroBiasZ = sumZ / got;
+  gyroBiasX = sumX / g_calibGot;
+  gyroBiasY = sumY / g_calibGot;
+  gyroBiasZ = sumZ / g_calibGot;
+
   lastUpdateMs = millis();
 
-  M5.Display.fillScreen(BLACK);
-  writeText("HeadMouse", isActivated ? WHITE : RED);
+  setEvent("Recalibrated", GREEN, 1500);
+  g_hudDirty = true;
   return true;
 }
-// Main head-mouse update: convert gyro rotation speed into mouse movement.
+
+// ------------------------------------------------------------
+// Mouse motion
+// ------------------------------------------------------------
 void updateMouseFromHead() {
   float gx, gy, gz;
-  if (!M5.Imu.getGyro(&gx, &gy, &gz)) {
-    return;
-  }
+  if (!M5.Imu.getGyro(&gx, &gy, &gz)) return;
 
-  // Remove bias.
   gx -= gyroBiasX;
   gy -= gyroBiasY;
   gz -= gyroBiasZ;
 
-  // Time delta in seconds.
   unsigned long now = millis();
   float dt = (now - lastUpdateMs) / 1000.0f;
-  if (dt <= 0.0f) {
-    dt = 0.001f;
-  } else if (dt > 0.05f) {
-    // Clamp dt to avoid huge jumps if something stalls.
-    dt = 0.05f;
-  }
+  if (dt <= 0.0f) dt = 0.001f;
+  else if (dt > 0.05f) dt = 0.05f;
   lastUpdateMs = now;
 
-  // Pack into array so we can choose axes dynamically.
   float g[3] = { gx, gy, gz };
-
   float rateX = g[HEADMOUSE_GYRO_AXIS_X];
   float rateY = g[HEADMOUSE_GYRO_AXIS_Y];
 
-  // Small deadzone to avoid jitter when the head is still.
-  if (fabsf(rateX) < gyroDeadzoneDps) {
-    rateX = 0.0f;
-  }
-  if (fabsf(rateY) < gyroDeadzoneDps) {
-    rateY = 0.0f;
-  }
+  if (fabsf(rateX) < gyroDeadzoneDps) rateX = 0.0f;
+  if (fabsf(rateY) < gyroDeadzoneDps) rateY = 0.0f;
 
-  // Convert angular rate into mouse step. This is basically integrating
-  // velocity: if you rotate and then stop, the cursor also stops.
   float stepX = gyroSensitivityX * rateX * dt;
   float stepY = gyroSensitivityY * rateY * dt;
 
-  // Limit maximum movement per update for stability.
   if (stepX > maxStepPerUpdate) stepX = maxStepPerUpdate;
   if (stepX < -maxStepPerUpdate) stepX = -maxStepPerUpdate;
   if (stepY > maxStepPerUpdate) stepY = maxStepPerUpdate;
@@ -273,55 +384,81 @@ void updateMouseFromHead() {
   dy = -dy;
 #endif
 
-  updateDebugDisplay(rateX, rateY, dx, dy);
+  if (ENABLE_DEBUG_DISPLAY) {
+    // If you want debug output, enable this flag and add your debug drawing here.
+  }
 
   if (bleMouse.isConnected() && isActivated && (dx != 0 || dy != 0)) {
-    // HID: positive X moves right; positive Y moves down.
-    bleMouse.move(dx, dy, 0);
+    bleMouse.move((signed char)dx, (signed char)dy, 0);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Button handling
-// ---------------------------------------------------------------------------
+// ------------------------------------------------------------
+// BLE advertising recovery
+// ------------------------------------------------------------
+void kickAdvertising(const char* reason) {
+  if (millis() - bleStartMs < BLE_BOOT_GRACE_MS) return;
+  BLEDevice::startAdvertising();
+  lastAdvKickMs = millis();
+  setEvent(String("ADV restart: ") + reason, YELLOW, 1200);
+  bleUiState = BLE_UI_ADVERTISING;
+  g_hudDirty = true;
+}
 
-void handleHomeButton() {
-  if (M5.BtnA.wasPressed()) {
-    homePressStart = millis();
-    homeHoldTriggered = false;
+void handleBleRecovery() {
+  bool connected = bleMouse.isConnected();
+
+  if (!lastBleConnected && connected) {
+    bleUiState = BLE_UI_CONNECTED;
+    setEvent("BLE Connected", GREEN, 1200);
+    g_hudDirty = true;
   }
 
-  if (M5.BtnA.isPressed() && !homeHoldTriggered &&
-      (millis() - homePressStart) > 1000) {
-    // Long press -> recalibrate gyro bias while assuming the head is still.
-    homeHoldTriggered = true;
-    calibrateGyroBias();
+  if (lastBleConnected && !connected) {
+    // Restart advertising after disconnect so other hosts can find it again.
+    kickAdvertising("disconnect");
   }
 
-  if (M5.BtnA.wasReleased()) {
-    if (!homeHoldTriggered) {
-      // Short press -> toggle head-mouse activation.
-      isActivated = !isActivated;
-      writeText("HeadMouse", isActivated ? WHITE : RED);
+  // While disconnected, keep advertising alive (some stacks stop advertising).
+  if (!connected) {
+    bleUiState = (millis() - bleStartMs < BLE_BOOT_GRACE_MS) ? BLE_UI_BOOTING : BLE_UI_ADVERTISING;
+
+    if ((millis() - lastAdvKickMs) > ADV_KICK_PERIOD_MS) {
+      kickAdvertising("watchdog");
     }
-    homeHoldTriggered = false;
   }
+
+  lastBleConnected = connected;
 }
 
-void handleSensitivityButton() {
-  if (M5.BtnB.wasReleased()) {
+// ------------------------------------------------------------
+// Buttons
+// ------------------------------------------------------------
+void handleButtons() {
+  // A hold -> recalibrate
+  if (M5.BtnA.wasHold()) {
+    calibrateGyroBias();
+    return;
+  }
+
+  // A click -> toggle activation
+  if (M5.BtnA.wasClicked()) {
+    toggleActivation();
+  }
+
+  // B click -> cycle sensitivity
+  if (M5.BtnB.wasClicked()) {
     cycleSensitivityProfile();
   }
 }
 
+// External mouse buttons (GPIO32/33)
 void handleExternalMouseButtons() {
-  if (!bleMouse.isConnected()) {
-    return;
-  }
+  if (!bleMouse.isConnected()) return;
+
   int left_state  = digitalRead(LEFT_BUTTON);
   int right_state = digitalRead(RIGHT_BUTTON);
 
-  // Simple edge detection; buttons assumed to be wired as digital inputs.
   if (left_state != left_button_last_state) {
     if (left_state == HIGH) {
       bleMouse.press(MOUSE_LEFT);
@@ -343,23 +480,26 @@ void handleExternalMouseButtons() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Setup and loop
-// ---------------------------------------------------------------------------
-
+// ------------------------------------------------------------
+// Setup / loop
+// ------------------------------------------------------------
 void setup() {
-  
   Serial.begin(115200);
   Serial.setTxBufferSize(1024);
   delay(200);
+
   Serial.println();
-  Serial.println("=== M5StickC M5Unified Head Mouse ===");
+  Serial.println("=== M5Unified HeadMouse (HUD + BLE recovery) ===");
 
   auto cfg = M5.config();
-  cfg.internal_mic = false;   // Microphone not used in this version.
-  cfg.internal_spk = false;
+  cfg.internal_imu  = true;
+  cfg.internal_mic  = false;
+  cfg.internal_spk  = false;
   cfg.clear_display = true;
-  cfg.output_power = true;
+  cfg.output_power  = true;
+
+  // Keep this as StickC if you build for StickC.
+  // For Plus2 you can change it to: m5::board_t::board_M5StickCPlus2
   cfg.fallback_board = m5::board_t::board_M5StickC;
 
   // Disable external displays.
@@ -375,55 +515,74 @@ void setup() {
 
   M5.begin(cfg);
 
+  // Plus2: keep power on after wake (safe to do only when detected).
+  if (M5.getBoard() == m5::board_t::board_M5StickCPlus2) {
+    pinMode(PLUS2_HOLD_PIN, OUTPUT);
+    digitalWrite(PLUS2_HOLD_PIN, HIGH);
+  }
+
   pinMode(LEFT_BUTTON, INPUT);
   pinMode(RIGHT_BUTTON, INPUT);
 
-  M5.Display.setRotation(2);
+  M5.Display.setRotation(1);
   M5.Display.setBrightness(200);
   M5.Display.fillScreen(BLACK);
-  writeText("HeadMouse", isActivated ? WHITE : RED);
+
+  // Button thresholds (more robust click/hold behavior).
+  M5.BtnA.setHoldThresh(1000);
+  M5.BtnB.setHoldThresh(1000);
+
   applySensitivityProfile(currentSensitivityIndex);
 
+  // Initial HUD draw
+  setEvent("Booting...", WHITE, 800);
+  bleUiState = BLE_UI_BOOTING;
+  drawHud(true);
+
   if (!ensureImuReady()) {
-    M5.Display.fillScreen(BLACK);
-    writeText("Cannot init IMU!", RED);
+    setEvent("IMU init FAILED", RED, 2500);
+    drawHud(true);
     delay(2000);
   }
 
-  // Lower IMU clock for stability.
   M5.Imu.setClock(IMU_CLOCK_HZ);
 
-  Serial.println("Starting Calibration");
-  // Initial gyro calibration; keep your head still during boot.
-  if (!calibrateGyroBias()) {
-    M5.Display.fillScreen(BLACK);
-    writeText("Cannot calibrate IMU!", RED);
-    delay(2000);
-  }
-  
+  Serial.println("[BOOT] Calibrating gyro bias...");
+  calibrateGyroBias();
 
- Serial.println("Calibration Done.");
-  M5.Display.fillScreen(BLACK);
-  writeText("Done. Starting...", WHITE);
-  
-
+  // Start BLE mouse (BLE stack runs in its own task).
+  Serial.println("[BOOT] Starting BLE mouse...");
+  bleStartMs = millis();
+  lastAdvKickMs = bleStartMs;
   bleMouse.begin();
+  bleUiState = BLE_UI_ADVERTISING;
+
   left_button_last_state  = digitalRead(LEFT_BUTTON);
   right_button_last_state = digitalRead(RIGHT_BUTTON);
-  delay(2000);
-  writeText("HeadMouse", isActivated ? WHITE : RED);
+
+  setEvent("Ready", WHITE, 1200);
+  drawHud(true);
 }
 
 void loop() {
   M5.update();
 
-  handleHomeButton();
-  handleSensitivityButton();
+  // BLE state + advertising recovery
+  handleBleRecovery();
+
+  // Buttons
+  handleButtons();
+
+  // Mouse motion
   updateMouseFromHead();
 
+  // External click buttons
   if (bleMouse.isConnected() && isActivated) {
     handleExternalMouseButtons();
   }
 
-  delay(LOOP_DELAY_MS);  // Small delay to keep loop timing reasonable.
+  // Refresh HUD (non-flickery; only if needed / timed)
+  drawHud(false);
+
+  delay(LOOP_DELAY_MS);
 }
